@@ -49,6 +49,13 @@ struct ft_shared_s
   uint64_t file_idx;
   /* System time Faketime started at */
   struct system_time_s start_time;
+  // user time offset
+  struct timespec offset;
+  struct timespec user_faked_time_timespec;
+  double user_rate;
+  bool user_rate_set;
+  // someone locks the time modify functionality
+  uint64_t locker_id;
 };
 
 /* These are all needed in order to properly build on OSX */

@@ -253,10 +253,10 @@ static bool user_faked_time_set = false;
 static char user_faked_time_saved[BUFFERLEN] = {0};
 
 /* Fractional user offset provided through FAKETIME env. var.*/
-static struct timespec user_offset = {0, -1};
+//static struct timespec user_offset = {0, -1};
 /* Speed up or slow down clock */
-static double user_rate = 1.0;
-static bool user_rate_set = false;
+//static double user_rate = 1.0;
+//static bool user_rate_set = false;
 static struct timespec user_per_tick_inc = {0, -1};
 static bool user_per_tick_inc_set = false;
 
@@ -288,17 +288,66 @@ static void ft_shm_init (void)
       exit(1);
     }
 
-    if (SEM_FAILED == (shared_sem = sem_open(sem_name, 0)))
+    if (SEM_FAILED == (shared_sem = sem_open(sem_name, O_CREAT | O_EXCL, S_IWUSR | S_IRUSR, 1)))
     {
-      perror("sem_open");
-      exit(1);
+		printf("create semaphore failed=%d\n", errno);
+		if (errno == EEXIST)
+		{
+			if (SEM_FAILED == (shared_sem = sem_open(sem_name, 0)))
+			{
+				perror("sem_open exists failed");
+				exit(1);
+			}
+			printf("Successfully attach semaphore\n");
+		}
+		else
+		{
+			perror("sem_open");
+			exit(1);
+		}
     }
+	printf("Successfully create semaphore\n");
 
-    if (-1 == (ticks_shm_fd = shm_open(shm_name, O_CREAT|O_RDWR, S_IWUSR|S_IRUSR)))
+	bool found_shared_mem = false;
+    if (-1 == (ticks_shm_fd = shm_open(shm_name, O_CREAT| O_EXCL | O_RDWR, S_IWUSR|S_IRUSR)))
     {
-      perror("shm_open");
-      exit(1);
+		printf("Create shared memory failed=%d\n", errno);
+		if (errno == EEXIST)
+		{
+			found_shared_mem = true;
+			if (-1 == (ticks_shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, S_IWUSR | S_IRUSR)))
+			{
+				perror("shm_open existing failed");
+				exit(1);
+			}
+			printf("Successfully attach shared memory\n");
+		}
+		else
+		{
+			perror("shm_open");
+			exit(1);
+		}
     }
+	printf("Successfully create shared memory\n");
+
+	if (!found_shared_mem)
+	{
+		if (-1 == ftruncate(ticks_shm_fd, sizeof(uint64_t)))
+		{
+			perror("ftruncate");
+			if (-1 == sem_unlink(sem_name))
+			{
+				perror("sem_unlink");
+			}
+			if (-1 == shm_unlink(shm_name))
+			{
+				perror("shm_unlink");
+			}
+			exit(EXIT_FAILURE);
+		}
+		found_shared_mem = true;
+		printf("Successfully set shared memory size\n");
+	}
 
     if (MAP_FAILED == (ft_shared = mmap(NULL, sizeof(struct ft_shared_s), PROT_READ|PROT_WRITE,
             MAP_SHARED, ticks_shm_fd, 0)))
@@ -306,6 +355,12 @@ static void ft_shm_init (void)
       perror("mmap");
       exit(1);
     }
+	printf("Successfully map shared memory\n");
+  }
+
+  if (!ft_shared)
+  {
+	  printf("Could not load shared memory, stop!!\n");
   }
 }
 
@@ -365,6 +420,100 @@ static void system_time_from_system (struct system_time_s * systime)
 #endif
 }
 
+// Users can set their rate dynamically
+// return 0  : Success
+// return -1 : Could not find loaded shared memory
+// return -2 : Could not acquire semaphore
+// return -3 : Could not release semaphore
+int set_user_rate(double rate)
+{
+	if (shared_sem != NULL)
+	{
+		if (sem_wait(shared_sem) == -1)
+		{
+			perror("sem_wait");
+			return -2;
+		}
+		ft_shared->user_rate = rate;
+		ft_shared->user_rate_set = true;
+		if (sem_post(shared_sem) == -1)
+		{
+			perror("sem_post");
+			return -3;
+		}
+	}
+	else
+	{
+		return -1;
+	}
+	return 0;
+}
+
+// Add time offset seconds.
+// return 0  : Success
+// return -1 : Could not find loaded shared memory
+// return -2 : Could not acquire semaphore
+// return -3 : Could not release semaphore
+int add_time_offset_seconds(double seconds)
+{
+	if (shared_sem != NULL)
+	{
+		if (sem_wait(shared_sem) == -1)
+		{
+			perror("sem_wait");
+			return -2;
+		}		
+		if (ft_mode != FT_NOOP) ft_mode = FT_START_AT;
+		/* fractional time offsets contributed by Karl Chen in v0.8 */		
+		ft_shared->offset.tv_sec += floor(seconds);
+		ft_shared->offset.tv_nsec += (seconds - ft_shared->offset.tv_sec) * SEC_TO_nSEC;
+		timespecadd(&ftpl_starttime.real, &ft_shared->offset, &ft_shared->user_faked_time_timespec);
+		if (sem_post(shared_sem) == -1)
+		{
+			perror("sem_post");
+			return -3;
+		}
+	}
+	else
+	{
+		return -1;
+	}	
+	return 0;
+}
+
+// Set locker id
+// return 0  : Success
+// return -1 : Could not find loaded shared memory
+// return -2 : Could not acquire semaphore
+// return -3 : Could not release semaphore
+int set_locker_id(uint64_t id)
+{
+	if (shared_sem != NULL)
+	{
+		if (sem_wait(shared_sem) == -1)
+		{
+			perror("sem_wait");
+			return -2;
+		}
+		ft_shared->locker_id = id;
+		if (sem_post(shared_sem) == -1)
+		{
+			perror("sem_post");
+			return -3;
+		}
+	}
+	else
+	{
+		return -1;
+	}
+	return 0;
+}
+
+uint64_t get_locker_id()
+{
+	return ft_shared->locker_id;
+}
+
 static void next_time(struct timespec *tp, struct timespec *ticklen)
 {
   if (shared_sem != NULL)
@@ -378,7 +527,7 @@ static void next_time(struct timespec *tp, struct timespec *ticklen)
     }
     /* calculate and update elapsed time */
     timespecmul(ticklen, ft_shared->ticks, &inc);
-    timespecadd(&user_faked_time_timespec, &inc, tp);
+    timespecadd(&ft_shared->user_faked_time_timespec, &inc, tp);
     (ft_shared->ticks)++;
     /* unlock */
     if (sem_post(shared_sem) == -1)
@@ -456,7 +605,7 @@ static bool load_time(struct timespec *tp)
     {
       /* we are out of timstamps to replay, return to faking time by rules
        * using last timestamp from file as the user provided timestamp */
-      timespec_from_saved(&user_faked_time_timespec, &stss[(infile_size / sizeof(stss[0])) - 1 ]);
+      timespec_from_saved(&ft_shared->user_faked_time_timespec, &stss[(infile_size / sizeof(stss[0])) - 1 ]);
 
       if (ft_shared->ticks == 0)
       {
@@ -830,9 +979,9 @@ int nanosleep(const struct timespec *req, struct timespec *rem)
   }
   if (req != NULL)
   {
-    if (user_rate_set && !dont_fake)
+    if (ft_shared->user_rate_set && !dont_fake)
     {
-      timespecmul(req, 1.0 / user_rate, &real_req);
+      timespecmul(req, 1.0 / ft_shared->user_rate, &real_req);
     }
     else
     {
@@ -853,9 +1002,9 @@ int nanosleep(const struct timespec *req, struct timespec *rem)
   /* fake returned parts */
   if ((rem != NULL) && ((rem->tv_sec != 0) || (rem->tv_nsec != 0)))
   {
-    if (user_rate_set && !dont_fake)
+    if (ft_shared->user_rate_set && !dont_fake)
     {
-      timespecmul(rem, user_rate, rem);
+      timespecmul(rem, ft_shared->user_rate, rem);
     }
   }
   /* return the result to the caller */
@@ -873,7 +1022,7 @@ int usleep(useconds_t usec)
   {
     ftpl_init();
   }
-  if (user_rate_set && !dont_fake)
+  if (ft_shared->user_rate_set && !dont_fake)
   {
     struct timespec real_req;
 
@@ -884,13 +1033,13 @@ int usleep(useconds_t usec)
       {
         return -1;
       }
-      DONT_FAKE_TIME(result = (*real_usleep)((1.0 / user_rate) * usec));
+      DONT_FAKE_TIME(result = (*real_usleep)((1.0 / ft_shared->user_rate) * usec));
       return result;
     }
 
     real_req.tv_sec = usec / 1000000;
     real_req.tv_nsec = (usec % 1000000) * 1000;
-    timespecmul(&real_req, 1.0 / user_rate, &real_req);
+    timespecmul(&real_req, 1.0 / ft_shared->user_rate, &real_req);
     DONT_FAKE_TIME(result = (*real_nanosleep)(&real_req, NULL));
   }
   else
@@ -909,7 +1058,7 @@ unsigned int sleep(unsigned int seconds)
   {
     ftpl_init();
   }
-  if (user_rate_set && !dont_fake)
+  if (ft_shared->user_rate_set && !dont_fake)
   {
     if (real_nanosleep == NULL)
     {
@@ -919,14 +1068,14 @@ unsigned int sleep(unsigned int seconds)
       {
         return 0;
       }
-      DONT_FAKE_TIME(ret = (*real_sleep)((1.0 / user_rate) * seconds));
-      return (user_rate_set && !dont_fake)?(user_rate * ret):ret;
+      DONT_FAKE_TIME(ret = (*real_sleep)((1.0 / ft_shared->user_rate) * seconds));
+      return (ft_shared->user_rate_set && !dont_fake)?(ft_shared->user_rate * ret):ret;
     }
     else
     {
       int result;
       struct timespec real_req = {seconds, 0}, rem;
-      timespecmul(&real_req, 1.0 / user_rate, &real_req);
+      timespecmul(&real_req, 1.0 / ft_shared->user_rate, &real_req);
       DONT_FAKE_TIME(result = (*real_nanosleep)(&real_req, &rem));
       if (result == -1)
       {
@@ -936,7 +1085,7 @@ unsigned int sleep(unsigned int seconds)
       /* fake returned parts */
       if ((rem.tv_sec != 0) || (rem.tv_nsec != 0))
       {
-        timespecmul(&rem, user_rate, &rem);
+        timespecmul(&rem, ft_shared->user_rate, &rem);
       }
       /* return the result to the caller */
       return rem.tv_sec;
@@ -959,7 +1108,7 @@ unsigned int sleep(unsigned int seconds)
 unsigned int alarm(unsigned int seconds)
 {
   unsigned int ret;
-  unsigned int seconds_real = (user_rate_set && !dont_fake)?((1.0 / user_rate) * seconds):seconds;
+  unsigned int seconds_real = (ft_shared->user_rate_set && !dont_fake)?((1.0 / ft_shared->user_rate) * seconds):seconds;
 
   if (!initialized)
   {
@@ -971,7 +1120,7 @@ unsigned int alarm(unsigned int seconds)
   }
 
   DONT_FAKE_TIME(ret = (*real_alarm)(seconds_real));
-  return (user_rate_set && !dont_fake)?(user_rate * ret):ret;
+  return (ft_shared->user_rate_set && !dont_fake)?(ft_shared->user_rate * ret):ret;
 }
 
 /*
@@ -993,9 +1142,9 @@ int ppoll(struct pollfd *fds, nfds_t nfds,
   }
   if (timeout_ts != NULL)
   {
-    if (user_rate_set && !dont_fake && (timeout_ts->tv_sec > 0))
+    if (ft_shared->user_rate_set && !dont_fake && (timeout_ts->tv_sec > 0))
     {
-      timespecmul(timeout_ts, 1.0 / user_rate, &real_timeout);
+      timespecmul(timeout_ts, 1.0 / ft_shared->user_rate, &real_timeout);
       real_timeout_pt = &real_timeout;
     }
     else
@@ -1018,7 +1167,7 @@ int ppoll(struct pollfd *fds, nfds_t nfds,
  */
 int poll(struct pollfd *fds, nfds_t nfds, int timeout)
 {
-  int ret, timeout_real = (user_rate_set && !dont_fake && (timeout > 0))?(timeout / user_rate):timeout;
+  int ret, timeout_real = (ft_shared->user_rate_set && !dont_fake && (timeout > 0))?(timeout / ft_shared->user_rate):timeout;
 
   if (!initialized)
   {
@@ -1056,14 +1205,14 @@ int select(int nfds, fd_set *readfds,
 
   if (timeout != NULL)
   {
-    if (user_rate_set && !dont_fake && (timeout->tv_sec > 0 || timeout->tv_usec > 0))
+    if (ft_shared->user_rate_set && !dont_fake && (timeout->tv_sec > 0 || timeout->tv_usec > 0))
     {
       struct timespec ts;
 
       ts.tv_sec = timeout->tv_sec;
       ts.tv_nsec = timeout->tv_usec * 1000;
 
-      timespecmul(&ts, 1.0 / user_rate, &ts);
+      timespecmul(&ts, 1.0 / ft_shared->user_rate, &ts);
 
       timeout_real.tv_sec = ts.tv_sec;
       timeout_real.tv_usec = ts.tv_nsec / 1000;
@@ -1102,11 +1251,11 @@ int sem_timedwait(sem_t *sem, const struct timespec *abs_timeout)
   {
     struct timespec tdiff, timeadj;
 
-    timespecsub(abs_timeout, &user_faked_time_timespec, &tdiff);
+    timespecsub(abs_timeout, &ft_shared->user_faked_time_timespec, &tdiff);
 
-    if (user_rate_set)
+    if (ft_shared->user_rate_set)
     {
-      timespecmul(&tdiff, user_rate, &timeadj);
+      timespecmul(&tdiff, ft_shared->user_rate, &timeadj);
     }
     else
     {
@@ -1177,9 +1326,9 @@ timer_settime_common(timer_t_or_int timerid, int flags,
       {
         struct timespec tdiff, timeadj;
         timespecsub(&new_value->it_value, &user_faked_time_timespec, &timeadj);
-        if (user_rate_set)
+        if (ft_shared->user_rate_set)
         {
-          timespecmul(&timeadj, 1.0/user_rate, &tdiff);
+          timespecmul(&timeadj, 1.0/ft_shared->user_rate, &tdiff);
         }
         else
         {
@@ -1190,9 +1339,9 @@ timer_settime_common(timer_t_or_int timerid, int flags,
       }
       else
       {
-        if (user_rate_set)
+        if (ft_shared->user_rate_set)
         {
-          timespecmul(&new_value->it_value, 1.0/user_rate, &new_real.it_value);
+          timespecmul(&new_value->it_value, 1.0/ft_shared->user_rate, &new_real.it_value);
         }
         else
         {
@@ -1205,10 +1354,10 @@ timer_settime_common(timer_t_or_int timerid, int flags,
       new_real.it_value = new_value->it_value;
     }
     /* set it_interval */
-    if (user_rate_set && ((new_value->it_interval.tv_sec != 0) ||
+    if (ft_shared->user_rate_set && ((new_value->it_interval.tv_sec != 0) ||
        (new_value->it_interval.tv_nsec != 0)))
     {
-      timespecmul(&new_value->it_interval, 1.0/user_rate, &new_real.it_interval);
+      timespecmul(&new_value->it_interval, 1.0/ft_shared->user_rate, &new_real.it_interval);
     }
     else
     {
@@ -1244,10 +1393,10 @@ timer_settime_common(timer_t_or_int timerid, int flags,
     {
       result = fake_clock_gettime(CLOCK_REALTIME, &old_value->it_value);
     }
-    if (user_rate_set && ((old_value->it_interval.tv_sec != 0) ||
+    if (ft_shared->user_rate_set && ((old_value->it_interval.tv_sec != 0) ||
        (old_value->it_interval.tv_nsec != 0)))
     {
-      timespecmul(&old_value->it_interval, user_rate, &old_value->it_interval);
+      timespecmul(&old_value->it_interval, ft_shared->user_rate, &old_value->it_interval);
     }
   }
 
@@ -1337,10 +1486,10 @@ int timer_gettime_common(timer_t_or_int timerid, struct itimerspec *curr_value, 
   /* fake returned parts */
   if (curr_value != NULL)
   {
-    if (user_rate_set && !dont_fake)
+    if (ft_shared->user_rate_set && !dont_fake)
     {
-      timespecmul(&curr_value->it_interval, user_rate, &curr_value->it_interval);
-      timespecmul(&curr_value->it_value, user_rate, &curr_value->it_value);
+      timespecmul(&curr_value->it_interval, ft_shared->user_rate, &curr_value->it_interval);
+      timespecmul(&curr_value->it_value, ft_shared->user_rate, &curr_value->it_value);
     }
   }
   /* return the result to the caller */
@@ -1609,9 +1758,22 @@ static void parse_ft_string(const char *user_faked_time)
       else if (strchr(user_faked_time, 'd') != NULL) frac_offset *= 60 * 60 * 24;
       else if (strchr(user_faked_time, 'y') != NULL) frac_offset *= 60 * 60 * 24 * 365;
 
-      user_offset.tv_sec = floor(frac_offset);
-      user_offset.tv_nsec = (frac_offset - user_offset.tv_sec) * SEC_TO_nSEC;
-      timespecadd(&ftpl_starttime.real, &user_offset, &user_faked_time_timespec);
+	  if (shared_sem != 0)
+	  {
+		  if (sem_wait(shared_sem) == -1)
+		  {
+			  perror("sem_wait");
+			  exit(1);
+		  }		  
+		  ft_shared->offset.tv_sec = floor(frac_offset);
+		  ft_shared->offset.tv_nsec = (frac_offset - ft_shared->offset.tv_sec) * SEC_TO_nSEC;
+		  timespecadd(&ftpl_starttime.real, &ft_shared->offset, &ft_shared->user_faked_time_timespec);
+		  if (sem_post(shared_sem) == -1)
+		  {
+			  perror("sem_post");
+			  exit(1);
+		  }
+	  }            
       goto parse_modifiers;
       break;
 
@@ -1648,8 +1810,22 @@ parse_modifiers:
       /* Speed-up / slow-down contributed by Karl Chen in v0.8 */
       if (strchr(user_faked_time, 'x') != NULL)
       {
-        user_rate = atof(strchr(user_faked_time, 'x')+1);
-        user_rate_set = true;
+		  if (shared_sem != 0)
+		  {
+			  if (sem_wait(shared_sem) == -1)
+			  {
+				  perror("sem_wait");
+				  exit(1);
+			  }			  
+			  ft_shared->user_rate = atof(strchr(user_faked_time, 'x') + 1);
+			  ft_shared->user_rate_set = true;
+			  if (sem_post(shared_sem) == -1)
+			  {
+				  perror("sem_post");
+				  exit(1);
+			  }
+		  }
+        
       }
       else if (NULL != (tmp_time_fmt = strchr(user_faked_time, 'i')))
       {
@@ -1677,9 +1853,10 @@ parse_modifiers:
  */
 
 static void ftpl_init(void)
-{
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         {
   char *tmp_env;
   bool dont_fake_final;
+  setbuf(stdout, NULL);
 
 #ifdef __APPLE__
   const char *progname = getprogname();
@@ -1977,7 +2154,7 @@ static void ftpl_init(void)
       perror("sem_wait");
       exit(1);
     }
-    if (ft_shared->start_time.real.tv_nsec == -1)
+    if (ft_shared->start_time.real.tv_nsec == 0)
     {
       /* set up global start time */
       system_time_from_system(&ftpl_starttime);
@@ -1999,11 +2176,23 @@ static void ftpl_init(void)
     system_time_from_system(&ftpl_starttime);
   }
   /* fake time supplied as environment variable? */
+//   if (NULL != (tmp_env = getenv("FAKETIME")))
+//   {
+//     parse_config_file = false;
+//     parse_ft_string(tmp_env);
+//   }
+  char user_faked_time[BUFFERLEN] = { 0 };
+  parse_config_file = false;
   if (NULL != (tmp_env = getenv("FAKETIME")))
   {
-    parse_config_file = false;
-    parse_ft_string(tmp_env);
+	  strncpy(user_faked_time, tmp_env, BUFFERLEN - 1);
+	  user_faked_time[BUFFERLEN - 1] = 0;
   }
+  else
+  {
+	  snprintf(user_faked_time, BUFFERLEN, "+0");
+  }
+  parse_ft_string(user_faked_time);
 
   dont_fake = dont_fake_final;
 }
@@ -2056,9 +2245,9 @@ int fake_clock_gettime(clockid_t clk_id, struct timespec *tp)
   /* Per process timers are only sped up or slowed down */
   if ((clk_id == CLOCK_PROCESS_CPUTIME_ID ) || (clk_id == CLOCK_THREAD_CPUTIME_ID))
   {
-    if (user_rate_set)
+    if (ft_shared->user_rate_set)
     {
-      timespecmul(tp, user_rate, tp);
+      timespecmul(tp, ft_shared->user_rate, tp);
     }
     return 0;
   }
@@ -2152,7 +2341,9 @@ int fake_clock_gettime(clockid_t clk_id, struct timespec *tp)
     cache_expired = 1;
   }
 
-  if (cache_expired == 1)
+  // cache never expires!!
+  cache_expired = 0;
+  if (cache_expired == 1)	 
   {
     static char user_faked_time[BUFFERLEN]; /* changed to static for caching in v0.6 */
     /* initialize with default or env. variable */
@@ -2221,7 +2412,7 @@ int fake_clock_gettime(clockid_t clk_id, struct timespec *tp)
     case FT_FREEZE:  /* a specified time */
       if (user_faked_time_set)
       {
-        *tp = user_faked_time_timespec;
+        *tp = ft_shared->user_faked_time_timespec;
       }
       break;
 
@@ -2261,15 +2452,15 @@ int fake_clock_gettime(clockid_t clk_id, struct timespec *tp)
             timespecsub(tp, &ftpl_starttime.real, &tdiff);
             break;
         } // end of switch (clk_id)
-        if (user_rate_set)
+        if (ft_shared->user_rate_set)
         {
-          timespecmul(&tdiff, user_rate, &timeadj);
+          timespecmul(&tdiff, ft_shared->user_rate, &timeadj);
         }
         else
         {
           timeadj = tdiff;
         }
-        timespecadd(&user_faked_time_timespec, &timeadj, tp);
+        timespecadd(&ft_shared->user_faked_time_timespec, &timeadj, tp);
       }
       break;
 
@@ -2601,9 +2792,9 @@ int pthread_cond_timedwait_common(pthread_cond_t *cond, pthread_mutex_t *mutex, 
     else
     {
       timespecsub(abstime, &faketime, &tp);
-      if (user_rate_set)
+      if (ft_shared->user_rate_set)
       {
-        timespecmul(&tp, 1.0 / user_rate, &tdiff_actual);
+        timespecmul(&tp, 1.0 / ft_shared->user_rate, &tdiff_actual);
       }
       else
       {
